@@ -13,7 +13,7 @@ import ccxt
 from dotenv import load_dotenv
 
 
-env_file = os.getenv("MONITOR_ENV_FILE", ".env.monitor")
+env_file = os.getenv("MONITOR_ENV_FILE", ".env")
 load_dotenv(env_file if os.path.exists(env_file) else None, override=False)
 
 # 统一日志：终端必打，文件日志按配置启用并自动轮转。
@@ -64,6 +64,8 @@ alert_cooldown = float(clean(os.getenv("ALERT_COOLDOWN", "60")))
 request_error_limit = int(clean(os.getenv("REQUEST_ERROR_LIMIT", "10")))
 price_diff_alert_pct = float(clean(os.getenv("PRICE_DIFF_ALERT_PCT", "10")))
 margin_ratio_alert = float(clean(os.getenv("MARGIN_RATIO_ALERT", "0.5")))
+margin_poll_interval = float(clean(os.getenv("MARGIN_POLL_INTERVAL", "15")))
+funding_rate_alert_apy_pct = float(clean(os.getenv("FUNDING_RATE_ALERT_APY_PCT", "-50")))
 enable_margin_monitor = env_bool("ENABLE_MARGIN_MONITOR", True)
 notify_webhook = clean(os.getenv("NOTIFY_WEBHOOK"))
 disable_webhook = env_bool("DISABLE_WEBHOOK", False)
@@ -75,6 +77,7 @@ if not monitor_exchanges:
 last_alert_at = {}
 price_errors = {}
 margin_errors = {}
+funding_errors = {}
 
 
 def alert(event, message, exchange=None, symbol=None, data=None, dedupe_key=None):
@@ -98,7 +101,7 @@ def alert(event, message, exchange=None, symbol=None, data=None, dedupe_key=None
         logger.warning("webhook failed: %s", exc)
 
 
-def build_exchange(exchange_id):
+def build_exchange(exchange_id, credential_prefix=None):
     if not hasattr(ccxt, exchange_id):
         sys.exit(f"ccxt does not support exchange: {exchange_id}")
 
@@ -111,9 +114,14 @@ def build_exchange(exchange_id):
     config = {"enableRateLimit": True, "options": options}
 
     if exchange_id == "aster":
-        private_key = clean(os.getenv("ASTER_PRIVATE_KEY") or os.getenv("PRIVATE_KEY"))
-        wallet_address = clean(os.getenv("ASTER_WALLET_ADDRESS") or os.getenv("WALLET_ADDRESS"))
-        signer_address = clean(os.getenv("ASTER_SIGNER_ADDRESS") or os.getenv("signerAddress"))
+        prefix = credential_prefix or "ASTER"
+        private_key = clean(os.getenv(f"{prefix}_PRIVATE_KEY"))
+        wallet_address = clean(os.getenv(f"{prefix}_WALLET_ADDRESS"))
+        signer_address = clean(os.getenv(f"{prefix}_SIGNER_ADDRESS"))
+        if prefix == "ASTER":
+            private_key = private_key or clean(os.getenv("PRIVATE_KEY"))
+            wallet_address = wallet_address or clean(os.getenv("WALLET_ADDRESS"))
+            signer_address = signer_address or clean(os.getenv("signerAddress"))
         if private_key and wallet_address and signer_address:
             options.update({"signerAddress": signer_address, "builderFee": False})
             config.update({"privateKey": private_key, "walletAddress": wallet_address})
@@ -152,7 +160,7 @@ def fetch_price(exchange, symbol, prefer_mark):
         funding = exchange.fetch_funding_rate(symbol)
         price = to_float(funding.get("markPrice")) or to_float((funding.get("info") or {}).get("markPrice"))
         if price and price > 0:
-            return price, "mark"
+            return price, "mark", funding
         raise RuntimeError("empty mark price")
 
     def mid_price():
@@ -160,7 +168,7 @@ def fetch_price(exchange, symbol, prefer_mark):
         bid = to_float(book["bids"][0][0]) if book.get("bids") else None
         ask = to_float(book["asks"][0][0]) if book.get("asks") else None
         if bid and ask and bid > 0 and ask > 0:
-            return (bid + ask) / 2, "bid_ask_mid"
+            return (bid + ask) / 2, "bid_ask_mid", None
         raise RuntimeError("empty bid/ask")
 
     for getter in ([mark_price, mid_price] if prefer_mark else [mid_price, mark_price]):
@@ -173,7 +181,7 @@ def fetch_price(exchange, symbol, prefer_mark):
     for key in ("mark", "last", "close"):
         price = to_float(ticker.get(key))
         if price and price > 0:
-            return price, f"ticker_{key}"
+            return price, f"ticker_{key}", None
     raise RuntimeError("; ".join(errors) or "empty ticker price")
 
 
@@ -189,36 +197,44 @@ def price_from_bid_ask(ticker):
 
 
 def fetch_batch_prices(exchange, symbols, prefer_mark):
-    # 正常路径每个交易所每轮只请求一次价格接口。
+    # 优先使用本轮价格源；失败时先切换另一个批量源，再按缺失币种回退。
     results = {}
-    batch_error = None
-    try:
-        if prefer_mark:
-            fundings = exchange.fetch_funding_rates(symbols)
-            for symbol in symbols:
-                price = price_from_funding(fundings.get(symbol))
-                if price:
-                    results[symbol] = (price, "mark")
-        else:
-            tickers = exchange.fetch_bids_asks(symbols)
-            for symbol in symbols:
-                price = price_from_bid_ask(tickers.get(symbol))
-                if price:
-                    results[symbol] = (price, "bid_ask_mid")
-    except Exception as exc:
-        batch_error = exc
+    funding_results = {}
+    modes = ("mark", "mid") if prefer_mark else ("mid", "mark")
+    for mode in modes:
+        missing = [symbol for symbol in symbols if symbol not in results]
+        if not missing:
+            break
+        try:
+            if mode == "mark":
+                fundings = exchange.fetch_funding_rates(missing)
+                for symbol in missing:
+                    funding = fundings.get(symbol)
+                    if funding:
+                        funding_results[symbol] = funding
+                    price = price_from_funding(funding)
+                    if price:
+                        results[symbol] = (price, "mark")
+            else:
+                tickers = exchange.fetch_bids_asks(missing)
+                for symbol in missing:
+                    price = price_from_bid_ask(tickers.get(symbol))
+                    if price:
+                        results[symbol] = (price, "bid_ask_mid")
+        except Exception as exc:
+            logger.error("%s batch %s request failed: %s", exchange.id, mode, exc)
 
-    # 批量结果缺失时才回退单币种请求，兼顾少请求和可用性。
     for symbol in symbols:
         if symbol in results:
             continue
         try:
-            results[symbol] = fetch_price(exchange, symbol, prefer_mark)
+            price, source, funding = fetch_price(exchange, symbol, prefer_mark)
+            results[symbol] = (price, source)
+            if funding:
+                funding_results[symbol] = funding
         except Exception as exc:
-            if batch_error:
-                raise RuntimeError(f"batch failed: {batch_error}; fallback failed for {symbol}: {exc}") from exc
-            raise
-    return results
+            logger.error("%s %s price fallback failed: %s", exchange.id, symbol, exc)
+    return results, funding_results
 
 
 def account_margin_ratio(account, source):
@@ -261,9 +277,12 @@ def fetch_margin_ratio(exchange):
 
 
 def main():
-    # 读取 5 个固定槽位：只填币种名称和高价报警阈值，默认使用 USDT 永续交易对。
+    if margin_poll_interval <= 0:
+        sys.exit("MARGIN_POLL_INTERVAL must be greater than 0")
+
+    # 读取 8 个固定槽位：只填币种名称和高价报警阈值，默认使用 USDT 永续交易对。
     monitor_symbols = []
-    for index in range(1, 6):
+    for index in range(1, 9):
         name = clean(os.getenv(f"MONITOR_SYMBOL_{index}")).upper()
         if not name:
             continue
@@ -273,7 +292,7 @@ def main():
         monitor_symbols.append({"name": name, "symbols": {}, "alertHigh": alert_high})
 
     if not monitor_symbols:
-        sys.exit("Missing MONITOR_SYMBOL_1..5 in .env.monitor")
+        sys.exit("Missing MONITOR_SYMBOL_1..8 in .env")
 
     exchanges = {}
     for exchange_id in monitor_exchanges:
@@ -309,21 +328,60 @@ def main():
     if not active_symbols:
         sys.exit("No configured symbol is available on selected exchanges")
 
+    # 费率结算周期只在启动时读取一次；未返回的合约按交易所默认 8 小时处理。
+    funding_intervals = {}
+    for exchange_id, exchange in exchanges.items():
+        symbols = [item["symbols"][exchange_id] for item in active_symbols if exchange_id in item["symbols"]]
+        funding_intervals[exchange_id] = {symbol: 8.0 for symbol in symbols}
+        fetch_intervals = getattr(exchange, "fetch_funding_intervals", None)
+        if not fetch_intervals or not symbols:
+            continue
+        try:
+            intervals = fetch_intervals(symbols)
+            for symbol, funding in intervals.items():
+                interval = clean((funding or {}).get("interval")).lower()
+                interval_hours = to_float(interval[:-1]) if interval.endswith("h") else None
+                if interval_hours is None:
+                    interval_hours = to_float(((funding or {}).get("info") or {}).get("fundingIntervalHours"))
+                if symbol in funding_intervals[exchange_id] and interval_hours and interval_hours > 0:
+                    funding_intervals[exchange_id][symbol] = interval_hours
+        except Exception as exc:
+            logger.warning("%s funding interval load failed, use 8h default: %s", exchange_id, exc)
+
+    margin_accounts = {}
+    if enable_margin_monitor:
+        for exchange_id, exchange in exchanges.items():
+            margin_accounts["aster-1" if exchange_id == "aster" else exchange_id] = exchange
+
+        if "aster" in exchanges:
+            second_keys = ("ASTER_2_PRIVATE_KEY", "ASTER_2_WALLET_ADDRESS", "ASTER_2_SIGNER_ADDRESS")
+            second_values = [clean(os.getenv(key)) for key in second_keys]
+            if any(second_values) and not all(second_values):
+                missing = ", ".join(key for key, value in zip(second_keys, second_values) if not value)
+                sys.exit(f"Incomplete Aster account 2 credentials: missing {missing}")
+            if all(second_values):
+                margin_accounts["aster-2"] = build_exchange("aster", "ASTER_2")
+                logger.info("aster-2 account configured")
+
     logger.info(
-        "monitor started: exchanges=%s, symbols=%s, poll_interval=%ss, margin_monitor=%s",
+        "monitor started: exchanges=%s, symbols=%s, poll_interval=%ss, margin_accounts=%s, margin_interval=%ss, funding_alert_apy=%s%%",
         ",".join(exchanges),
         ",".join(item["name"] for item in active_symbols),
         poll_interval,
-        enable_margin_monitor,
+        ",".join(margin_accounts) if margin_accounts else "disabled",
+        margin_poll_interval,
+        funding_rate_alert_apy_pct,
     )
 
     round_no = 0
     once = "--once" in sys.argv
+    next_margin_at = 0.0
     while True:
         round_no += 1
         # 奇数轮查标记价格，偶数轮查买卖一中间价。
         prefer_mark = round_no % 2 == 1
         prices = {item["name"]: {} for item in active_symbols}
+        funding_rates = {item["name"]: {} for item in active_symbols}
         logger.info("round=%s price_mode=%s", round_no, "mark" if prefer_mark else "bid_ask_mid")
 
         for exchange_id, exchange in exchanges.items():
@@ -331,9 +389,10 @@ def main():
             exchange_items = [item for item in active_symbols if exchange_id in item["symbols"]]
             symbols = [item["symbols"][exchange_id] for item in exchange_items]
             batch_prices = {}
+            batch_fundings = {}
             if symbols:
                 try:
-                    batch_prices = fetch_batch_prices(exchange, symbols, prefer_mark)
+                    batch_prices, batch_fundings = fetch_batch_prices(exchange, symbols, prefer_mark)
                 except Exception as exc:
                     logger.error("%s batch price monitor failed: %s", exchange_id, exc)
 
@@ -366,6 +425,58 @@ def main():
                             item["name"],
                             {"errors": price_errors[error_key], "lastError": str(exc)},
                         )
+
+                if prefer_mark:
+                    funding_key = (exchange_id, item["name"])
+                    try:
+                        funding = batch_fundings.get(symbol) or {}
+                        rate = to_float(funding.get("fundingRate"))
+                        if rate is None:
+                            rate = to_float((funding.get("info") or {}).get("lastFundingRate"))
+                        if rate is None:
+                            raise RuntimeError("funding rate missing from batch response")
+                        interval_hours = funding_intervals.get(exchange_id, {}).get(symbol, 8.0)
+                        annualized_pct = rate * 24 / interval_hours * 365 * 100
+                        funding_errors[funding_key] = 0
+                        funding_rates[item["name"]][exchange_id] = {
+                            "rate": rate,
+                            "intervalHours": interval_hours,
+                            "annualizedPct": annualized_pct,
+                        }
+                        if annualized_pct < funding_rate_alert_apy_pct:
+                            alert(
+                                "funding_rate_low",
+                                f"{exchange_id} {symbol} funding APY {annualized_pct:.2f}% < {funding_rate_alert_apy_pct}% "
+                                f"(rate {rate * 100:.6f}%/{interval_hours:g}h)",
+                                exchange_id,
+                                symbol,
+                                {
+                                    "coin": item["name"],
+                                    "fundingRate": rate,
+                                    "fundingRatePct": rate * 100,
+                                    "intervalHours": interval_hours,
+                                    "annualizedPct": annualized_pct,
+                                    "thresholdPct": funding_rate_alert_apy_pct,
+                                },
+                            )
+                    except Exception as exc:
+                        funding_errors[funding_key] = funding_errors.get(funding_key, 0) + 1
+                        logger.error(
+                            "%s %s funding monitor failed (%s/%s): %s",
+                            exchange_id,
+                            item["name"],
+                            funding_errors[funding_key],
+                            request_error_limit,
+                            exc,
+                        )
+                        if funding_errors[funding_key] % request_error_limit == 0:
+                            alert(
+                                "funding_monitor_failed",
+                                f"{exchange_id} {item['name']} funding monitor failed {funding_errors[funding_key]} times",
+                                exchange_id,
+                                item["name"],
+                                {"errors": funding_errors[funding_key], "lastError": str(exc)},
+                            )
 
         for item in active_symbols:
             # 终端按币种合并显示，一行包含各交易所价格和最大价差。
@@ -403,35 +514,43 @@ def main():
                         )
             if max_diff_pct is not None:
                 parts.append(f"diff={max_diff_pct:.2f}%")
+            for exchange_id in exchanges:
+                funding = funding_rates[item["name"]].get(exchange_id)
+                if funding:
+                    parts.append(
+                        f"{exchange_id}_funding={funding['rate'] * 100:.6f}%/{funding['intervalHours']:g}h"
+                        f"(apy={funding['annualizedPct']:.2f}%)"
+                    )
             if len(parts) > 1:
                 logger.info(" | ".join(parts))
 
-        if enable_margin_monitor:
-            # 保证金比例按交易所监控，失败连续达到阈值也会报警。
+        if enable_margin_monitor and time.monotonic() >= next_margin_at:
+            next_margin_at = time.monotonic() + margin_poll_interval
+            # 保证金比例按账户监控，失败连续达到阈值也会报警。
             margin_parts = ["Margin Ratio"]
-            for exchange_id, exchange in exchanges.items():
+            for account_name, exchange in margin_accounts.items():
                 try:
                     ratio, source = fetch_margin_ratio(exchange)
-                    margin_errors[exchange_id] = 0
-                    margin_parts.append(f"{exchange_id}={ratio:.4f}")
+                    margin_errors[account_name] = 0
+                    margin_parts.append(f"{account_name}={ratio:.4f}")
                     if ratio > margin_ratio_alert:
                         alert(
                             "margin_ratio_high",
-                            f"{exchange_id} margin ratio {ratio:.4f} > {margin_ratio_alert}",
-                            exchange_id,
+                            f"{account_name} margin ratio {ratio:.4f} > {margin_ratio_alert}",
+                            account_name,
                             None,
                             {"marginRatio": ratio, "marginSource": source, "threshold": margin_ratio_alert},
                         )
                 except Exception as exc:
-                    margin_errors[exchange_id] = margin_errors.get(exchange_id, 0) + 1
-                    logger.error("%s margin monitor failed (%s/%s): %s", exchange_id, margin_errors[exchange_id], request_error_limit, exc)
-                    if margin_errors[exchange_id] % request_error_limit == 0:
+                    margin_errors[account_name] = margin_errors.get(account_name, 0) + 1
+                    logger.error("%s margin monitor failed (%s/%s): %s", account_name, margin_errors[account_name], request_error_limit, exc)
+                    if margin_errors[account_name] % request_error_limit == 0:
                         alert(
                             "margin_monitor_failed",
-                            f"{exchange_id} margin monitor failed {margin_errors[exchange_id]} times",
-                            exchange_id,
+                            f"{account_name} margin monitor failed {margin_errors[account_name]} times",
+                            account_name,
                             None,
-                            {"errors": margin_errors[exchange_id], "lastError": str(exc)},
+                            {"errors": margin_errors[account_name], "lastError": str(exc)},
                         )
             if len(margin_parts) > 1:
                 logger.info(" | ".join(margin_parts))

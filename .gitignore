@@ -2,7 +2,6 @@
 .env
 .env.*
 !.env.example
-env.monitor
 
 # Runtime output
 *.log
@@ -35,4 +34,3 @@ dist/
 *.swp
 .DS_Store
 Thumbs.db
-
